@@ -13,6 +13,7 @@ import {
   TOKEN_2022_PROGRAM_ADDRESS,
 } from "@solana-program/token-2022";
 import {
+  address,
   decompileTransactionMessage,
   getCompiledTransactionMessageDecoder,
   type Address,
@@ -27,8 +28,35 @@ import type {
 } from "@x402/core/types";
 import { MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS } from "../../constants";
 import type { FacilitatorSvmSigner } from "../../signer";
-import type { ExactSvmPayloadV2 } from "../../types";
+import type {
+  ExactSvmPayloadV2,
+  InstructionVerifierContext,
+  SvmVerificationConfig,
+  VerifiableInstruction,
+} from "../../types";
 import { decodeTransactionFromPayload, getTokenPayerFromTransaction } from "../../utils";
+
+/**
+ * Result of instruction validation
+ */
+interface InstructionValidationResult {
+  isValid: boolean;
+  reason?: string;
+  /** Index of the transfer instruction in the transaction */
+  transferInstructionIndex: number;
+}
+
+/**
+ * Default verification configuration for the ExactSvmScheme.
+ */
+const DEFAULT_VERIFICATION_CONFIG: Required<SvmVerificationConfig> = {
+  allowAdditionalInstructions: false,
+  maxInstructionCount: 3,
+  allowedProgramIds: [],
+  blockedProgramIds: [],
+  customVerifiers: [],
+  requireFeePayerNotInInstructions: true,
+};
 
 /**
  * SVM facilitator implementation for the Exact payment scheme.
@@ -40,10 +68,14 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
   /**
    * Creates a new ExactSvmFacilitator instance.
    *
-   * @param signer - The SVM RPC client for facilitator operations
+   * @param signer - The SVM signer for facilitator operations
+   * @param verificationConfig - Optional configuration for transaction verification
    * @returns ExactSvmFacilitator instance
    */
-  constructor(private readonly signer: FacilitatorSvmSigner) {}
+  constructor(
+    private readonly signer: FacilitatorSvmSigner,
+    private readonly verificationConfig: SvmVerificationConfig = {},
+  ) {}
 
   /**
    * Get mechanism-specific extra data for the supported kinds endpoint.
@@ -140,28 +172,6 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     const decompiled = decompileTransactionMessage(compiled);
     const instructions = decompiled.instructions ?? [];
 
-    // 3 instructions: ComputeLimit + ComputePrice + TransferChecked
-    if (instructions.length !== 3) {
-      return {
-        isValid: false,
-        invalidReason: "invalid_exact_svm_payload_transaction_instructions_length",
-        payer: "",
-      };
-    }
-
-    // Step 3: Verify Compute Budget Instructions
-    try {
-      this.verifyComputeLimitInstruction(instructions[0] as never);
-      this.verifyComputePriceInstruction(instructions[1] as never);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        isValid: false,
-        invalidReason: errorMessage,
-        payer: "",
-      };
-    }
-
     const payer = getTokenPayerFromTransaction(transaction);
     if (!payer) {
       return {
@@ -171,8 +181,23 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
       };
     }
 
+    // Step 3: Validate instruction structure (flexible based on config)
+    const validationResult = this.validateInstructions(
+      instructions as never,
+      signerAddresses,
+      requirements.extra.feePayer,
+    );
+
+    if (!validationResult.isValid) {
+      return {
+        isValid: false,
+        invalidReason: validationResult.reason ?? "invalid_instructions",
+        payer,
+      };
+    }
+
     // Step 4: Verify Transfer Instruction
-    const transferIx = instructions[2];
+    const transferIx = instructions[validationResult.transferInstructionIndex];
     const programAddress = transferIx.programAddress.toString();
 
     if (
@@ -203,7 +228,6 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     }
 
     // Verify that the facilitator's signers are not transferring their own funds
-    // SECURITY: Prevent facilitator from signing away their own tokens
     const authorityAddress = parsedTransfer.accounts.authority.address.toString();
     if (signerAddresses.includes(authorityAddress)) {
       return {
@@ -261,7 +285,6 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
     }
 
     // Step 5: Sign and Simulate Transaction
-    // CRITICAL: Simulation proves transaction will succeed (catches insufficient balance, invalid accounts, etc)
     try {
       const feePayer = requirements.extra.feePayer as Address;
 
@@ -351,6 +374,199 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
         payer: valid.payer || "",
       };
     }
+  }
+
+  /**
+   * Validates the instruction structure of the transaction.
+   *
+   * Required structure:
+   * - Index 0: SetComputeUnitLimit instruction
+   * - Index 1: SetComputeUnitPrice instruction
+   * - Index 2: TransferChecked instruction (Token or Token-2022)
+   * - Index 3+: Additional instructions (if allowAdditionalInstructions is true)
+   *
+   * @param instructions - The decompiled instructions from the transaction
+   * @param signerAddresses - Addresses managed by the facilitator
+   * @param feePayer - The fee payer address
+   * @returns Validation result with transfer instruction index
+   */
+  private validateInstructions(
+    instructions: readonly {
+      programAddress: Address;
+      accounts?: readonly { address: Address }[];
+      data?: Readonly<Uint8Array>;
+    }[],
+    signerAddresses: string[],
+    feePayer: string,
+  ): InstructionValidationResult {
+    const config = { ...DEFAULT_VERIFICATION_CONFIG, ...this.verificationConfig };
+
+    // Minimum: ComputeLimit + ComputePrice + TransferChecked
+    if (instructions.length < 3) {
+      return {
+        isValid: false,
+        reason: "invalid_exact_svm_payload_transaction_instructions_length_too_few",
+        transferInstructionIndex: 2,
+      };
+    }
+
+    // Check maximum instruction count
+    if (instructions.length > config.maxInstructionCount) {
+      return {
+        isValid: false,
+        reason: `invalid_exact_svm_payload_transaction_instructions_length_exceeds_max_${config.maxInstructionCount}`,
+        transferInstructionIndex: 2,
+      };
+    }
+
+    // Verify fee payer is not in any instruction's accounts
+    if (config.requireFeePayerNotInInstructions) {
+      for (let i = 0; i < instructions.length; i++) {
+        const ix = instructions[i];
+        if (this.instructionIncludesAccount(ix, feePayer)) {
+          return {
+            isValid: false,
+            reason: "invalid_exact_svm_payload_fee_payer_in_instruction_accounts",
+            transferInstructionIndex: 2,
+          };
+        }
+      }
+    }
+
+    // Verify required instructions at positions 0, 1, 2
+    try {
+      this.verifyComputeLimitInstruction(instructions[0] as never);
+    } catch (error) {
+      return {
+        isValid: false,
+        reason: error instanceof Error ? error.message : String(error),
+        transferInstructionIndex: 2,
+      };
+    }
+
+    try {
+      this.verifyComputePriceInstruction(instructions[1] as never);
+    } catch (error) {
+      return {
+        isValid: false,
+        reason: error instanceof Error ? error.message : String(error),
+        transferInstructionIndex: 2,
+      };
+    }
+
+    // Verify instruction at index 2 is a token transfer
+    const transferIx = instructions[2];
+    const transferProgramId = transferIx.programAddress.toString();
+    if (
+      transferProgramId !== TOKEN_PROGRAM_ADDRESS.toString() &&
+      transferProgramId !== TOKEN_2022_PROGRAM_ADDRESS.toString()
+    ) {
+      return {
+        isValid: false,
+        reason: "invalid_exact_svm_payload_no_transfer_instruction_at_index_2",
+        transferInstructionIndex: 2,
+      };
+    }
+
+    // Validate additional instructions (if any)
+    if (instructions.length > 3) {
+      if (!config.allowAdditionalInstructions) {
+        return {
+          isValid: false,
+          reason: "invalid_exact_svm_payload_additional_instructions_not_allowed",
+          transferInstructionIndex: 2,
+        };
+      }
+
+      // Validate each additional instruction
+      for (let i = 3; i < instructions.length; i++) {
+        const ix = instructions[i];
+        const programId = ix.programAddress.toString();
+
+        // Check blocked list first (takes precedence)
+        if (config.blockedProgramIds.includes(programId)) {
+          return {
+            isValid: false,
+            reason: `invalid_exact_svm_payload_blocked_program_${programId}`,
+            transferInstructionIndex: 2,
+          };
+        }
+
+        // Check for custom verifier
+        const customVerifier = config.customVerifiers.find(v =>
+          v.programIds.includes(address(programId)),
+        );
+        if (customVerifier) {
+          // Check position constraint if set
+          if (customVerifier.allowedPositions && !customVerifier.allowedPositions.includes(i)) {
+            return {
+              isValid: false,
+              reason: `invalid_exact_svm_payload_instruction_position_${programId}_at_${i}`,
+              transferInstructionIndex: 2,
+            };
+          }
+
+          // Run custom verification if provided
+          if (customVerifier.verify) {
+            try {
+              const verifiableIx: VerifiableInstruction = {
+                programAddress: ix.programAddress,
+                accounts: ix.accounts as VerifiableInstruction["accounts"],
+                data: ix.data,
+              };
+              const context: InstructionVerifierContext = {
+                signerAddresses: signerAddresses.map(addr => address(addr)),
+                feePayer: address(feePayer),
+                instructionIndex: i,
+              };
+              customVerifier.verify(verifiableIx, context);
+            } catch (error) {
+              return {
+                isValid: false,
+                reason:
+                  error instanceof Error ? error.message : `custom_verifier_failed_${programId}`,
+                transferInstructionIndex: 2,
+              };
+            }
+          }
+          continue;
+        }
+
+        // Fall back to allowedProgramIds whitelist
+        // If whitelist is set (non-empty), program must be in it
+        // If whitelist is empty, allow any program (permissive mode)
+        if (config.allowedProgramIds.length > 0 && !config.allowedProgramIds.includes(programId)) {
+          return {
+            isValid: false,
+            reason: `invalid_exact_svm_payload_program_not_allowed_${programId}`,
+            transferInstructionIndex: 2,
+          };
+        }
+      }
+    }
+
+    return {
+      isValid: true,
+      transferInstructionIndex: 2,
+    };
+  }
+
+  /**
+   * Checks if an instruction includes a specific account address.
+   *
+   * @param instruction - The instruction to check
+   * @param instruction.accounts - The accounts list from the instruction
+   * @param accountAddress - The account address to look for
+   * @returns true if the account is found in the instruction's accounts
+   */
+  private instructionIncludesAccount(
+    instruction: { accounts?: readonly { address: Address }[] },
+    accountAddress: string,
+  ): boolean {
+    if (!instruction.accounts) {
+      return false;
+    }
+    return instruction.accounts.some(acc => acc.address.toString() === accountAddress);
   }
 
   /**

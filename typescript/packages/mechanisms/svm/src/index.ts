@@ -20,6 +20,15 @@ export type {
 // Export payload types
 export type { ExactSvmPayloadV1, ExactSvmPayloadV2 } from "./types";
 
+// Export verification config types
+export type {
+  SvmVerificationConfig,
+  InstructionVerifierConfig,
+  InstructionVerifier,
+  InstructionVerifierContext,
+  VerifiableInstruction,
+} from "./types";
+
 // Export constants
 export * from "./constants";
 
