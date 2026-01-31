@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -173,7 +174,7 @@ func TestHTTPFacilitatorClientVerify(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
@@ -203,15 +204,58 @@ func TestHTTPFacilitatorClientVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
 	if !response.IsValid {
 		t.Error("Expected valid response")
 	}
 	if response.Payer != "0xverifiedpayer" {
 		t.Errorf("Expected payer 0xverifiedpayer, got %s", response.Payer)
+	}
+}
+
+func TestHTTPFacilitatorClientVerifyInvalidResponse(t *testing.T) {
+	ctx := context.Background()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"isValid":`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPFacilitatorClient(&FacilitatorConfig{
+		URL: server.URL,
+	})
+
+	requirements := x402.PaymentRequirements{
+		Scheme:  "exact",
+		Network: "eip155:1",
+		Asset:   "USDC",
+		Amount:  "1000000",
+		PayTo:   "0xrecipient",
+	}
+
+	payload := x402.PaymentPayload{
+		X402Version: 2,
+		Accepted:    requirements,
+		Payload:     map[string]interface{}{"sig": "test"},
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	requirementsBytes, _ := json.Marshal(requirements)
+
+	_, err := client.Verify(ctx, payloadBytes, requirementsBytes)
+	if err == nil {
+		t.Fatal("Expected error for invalid verify response")
+	}
+
+	var verifyErr *x402.VerifyError
+	if !errors.As(err, &verifyErr) {
+		t.Fatalf("Expected VerifyError, got: %T (%v)", err, err)
+	}
+	if verifyErr.InvalidReason != x402.ErrInvalidResponse {
+		t.Errorf("Expected InvalidReason %q, got %q", x402.ErrInvalidResponse, verifyErr.InvalidReason)
+	}
+	if verifyErr.InvalidMessage == "" {
+		t.Error("Expected InvalidMessage to be set for invalid response")
 	}
 }
 
@@ -233,7 +277,7 @@ func TestHTTPFacilitatorClientSettle(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
@@ -262,10 +306,6 @@ func TestHTTPFacilitatorClientSettle(t *testing.T) {
 	response, err := client.Settle(ctx, payloadBytes, requirementsBytes)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
 	}
 	if !response.Success {
 		t.Error("Expected successful settlement")
@@ -306,7 +346,7 @@ func TestHTTPFacilitatorClientGetSupported(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
@@ -344,11 +384,11 @@ func TestHTTPFacilitatorClientWithAuth(t *testing.T) {
 		// Return minimal response
 		switch r.URL.Path {
 		case "/verify":
-			json.NewEncoder(w).Encode(x402.VerifyResponse{IsValid: true, Payer: "0xpayer"})
+			_ = json.NewEncoder(w).Encode(x402.VerifyResponse{IsValid: true, Payer: "0xpayer"})
 		case "/settle":
-			json.NewEncoder(w).Encode(x402.SettleResponse{Success: true, Transaction: "0xtx", Payer: "0xpayer", Network: "eip155:1"})
+			_ = json.NewEncoder(w).Encode(x402.SettleResponse{Success: true, Transaction: "0xtx", Payer: "0xpayer", Network: "eip155:1"})
 		case "/supported":
-			json.NewEncoder(w).Encode(x402.SupportedResponse{})
+			_ = json.NewEncoder(w).Encode(x402.SupportedResponse{})
 		}
 	}))
 	defer server.Close()
@@ -402,7 +442,7 @@ func TestHTTPFacilitatorClientErrorHandling(t *testing.T) {
 	// Create test server that returns errors
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("Bad request"))
+		_, _ = w.Write([]byte("Bad request"))
 	}))
 	defer server.Close()
 
@@ -444,6 +484,82 @@ func TestHTTPFacilitatorClientErrorHandling(t *testing.T) {
 	_, err = client.GetSupported(ctx)
 	if err == nil {
 		t.Error("Expected error for getSupported")
+	}
+}
+
+func TestHTTPFacilitatorClient400WithValidResponse(t *testing.T) {
+	ctx := context.Background()
+
+	// Create test server that returns 400 with valid response structures
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+
+		switch r.URL.Path {
+		case "/verify":
+			response := x402.VerifyResponse{
+				IsValid:       false,
+				InvalidReason: "invalid_signature",
+				Payer:         "0xpayer",
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		case "/settle":
+			response := x402.SettleResponse{
+				Success:     false,
+				ErrorReason: "insufficient_allowance",
+				Network:     "eip155:1",
+				Payer:       "0xpayer",
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer server.Close()
+
+	client := NewHTTPFacilitatorClient(&FacilitatorConfig{
+		URL: server.URL,
+	})
+
+	requirements := x402.PaymentRequirements{
+		Scheme:  "exact",
+		Network: "eip155:1",
+		Asset:   "USDC",
+		Amount:  "1000000",
+		PayTo:   "0xrecipient",
+	}
+
+	payload := x402.PaymentPayload{
+		X402Version: 2,
+		Accepted:    requirements,
+		Payload:     map[string]interface{}{},
+	}
+
+	payloadBytes, _ := json.Marshal(payload)
+	requirementsBytes, _ := json.Marshal(requirements)
+
+	// Test Verify - should return VerifyError with 400 response
+	_, err := client.Verify(ctx, payloadBytes, requirementsBytes)
+	if err == nil {
+		t.Fatal("Expected error for verify with 400 response")
+	}
+	var verifyErr *x402.VerifyError
+	if !errors.As(err, &verifyErr) {
+		t.Fatalf("Expected VerifyError, got: %T (%v)", err, err)
+	}
+	if verifyErr.InvalidReason != "invalid_signature" {
+		t.Errorf("Expected Reason 'invalid_signature', got %s", verifyErr.InvalidReason)
+	}
+
+	// Test Settle - should return SettleError with 400 response
+	_, err = client.Settle(ctx, payloadBytes, requirementsBytes)
+	if err == nil {
+		t.Fatal("Expected error for settle with 400 response")
+	}
+	var settleErr *x402.SettleError
+	if !errors.As(err, &settleErr) {
+		t.Fatalf("Expected SettleError, got: %T (%v)", err, err)
+	}
+	if settleErr.ErrorReason != "insufficient_allowance" {
+		t.Errorf("Expected Reason 'insufficient_allowance', got %s", settleErr.ErrorReason)
 	}
 }
 
@@ -502,7 +618,7 @@ func TestMultiFacilitatorClient(t *testing.T) {
 		id: "client1",
 		verifyFunc: func(ctx context.Context, payloadBytes []byte, requirementsBytes []byte) (*x402.VerifyResponse, error) {
 			var p x402.PaymentPayload
-			json.Unmarshal(payloadBytes, &p)
+			_ = json.Unmarshal(payloadBytes, &p)
 			if p.Accepted.Scheme == "exact" {
 				return &x402.VerifyResponse{IsValid: true, Payer: "client1"}, nil
 			}
@@ -523,7 +639,7 @@ func TestMultiFacilitatorClient(t *testing.T) {
 		id: "client2",
 		verifyFunc: func(ctx context.Context, payloadBytes []byte, requirementsBytes []byte) (*x402.VerifyResponse, error) {
 			var p x402.PaymentPayload
-			json.Unmarshal(payloadBytes, &p)
+			_ = json.Unmarshal(payloadBytes, &p)
 			if p.Accepted.Scheme == "transfer" {
 				return &x402.VerifyResponse{IsValid: true, Payer: "client2"}, nil
 			}
