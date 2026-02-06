@@ -36,12 +36,10 @@ type HTTPAdapter interface {
 
 // PaywallConfig configures the HTML paywall for browser requests
 type PaywallConfig struct {
-	CDPClientKey         string `json:"cdpClientKey,omitempty"`
-	AppName              string `json:"appName,omitempty"`
-	AppLogo              string `json:"appLogo,omitempty"`
-	SessionTokenEndpoint string `json:"sessionTokenEndpoint,omitempty"`
-	CurrentURL           string `json:"currentUrl,omitempty"`
-	Testnet              bool   `json:"testnet,omitempty"`
+	AppName    string `json:"appName,omitempty"`
+	AppLogo    string `json:"appLogo,omitempty"`
+	CurrentURL string `json:"currentUrl,omitempty"`
+	Testnet    bool   `json:"testnet,omitempty"`
 }
 
 // DynamicPayToFunc is a function that resolves payTo address dynamically based on request context
@@ -309,8 +307,13 @@ func (s *x402HTTPResourceServer) ProcessHTTPRequest(ctx context.Context, reqCtx 
 	}
 
 	// Create resource info from route config
+	resourceURL := routeConfig.Resource
+	if resourceURL == "" {
+		resourceURL = reqCtx.Adapter.GetURL()
+	}
+
 	resourceInfo := &types.ResourceInfo{
-		URL:         reqCtx.Adapter.GetURL(),
+		URL:         resourceURL,
 		Description: routeConfig.Description,
 		MimeType:    routeConfig.MimeType,
 	}
@@ -319,7 +322,6 @@ func (s *x402HTTPResourceServer) ProcessHTTPRequest(ctx context.Context, reqCtx 
 		if requirements[i].Extra == nil {
 			requirements[i].Extra = make(map[string]interface{})
 		}
-		requirements[i].Extra["resourceUrl"] = resourceInfo.URL
 	}
 
 	extensions := routeConfig.Extensions
@@ -353,15 +355,26 @@ func (s *x402HTTPResourceServer) ProcessHTTPRequest(ctx context.Context, reqCtx 
 			unpaidResponse = unpaidResp
 		}
 
+		response, err := s.createHTTPResponseV2(
+			paymentRequired,
+			s.isWebBrowser(reqCtx.Adapter),
+			paywallConfig,
+			routeConfig.CustomPaywallHTML,
+			unpaidResponse,
+		)
+		if err != nil {
+			return HTTPProcessResult{
+				Type: ResultPaymentError,
+				Response: &HTTPResponseInstructions{
+					Status:  500,
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    map[string]string{"error": fmt.Sprintf("Failed to create payment response: %v", err)},
+				},
+			}
+		}
 		return HTTPProcessResult{
-			Type: ResultPaymentError,
-			Response: s.createHTTPResponseV2(
-				paymentRequired,
-				s.isWebBrowser(reqCtx.Adapter),
-				paywallConfig,
-				routeConfig.CustomPaywallHTML,
-				unpaidResponse,
-			),
+			Type:     ResultPaymentError,
+			Response: response,
 		}
 	}
 
@@ -375,9 +388,20 @@ func (s *x402HTTPResourceServer) ProcessHTTPRequest(ctx context.Context, reqCtx 
 			extensions,
 		)
 
+		response, err := s.createHTTPResponseV2(paymentRequired, false, paywallConfig, "", nil)
+		if err != nil {
+			return HTTPProcessResult{
+				Type: ResultPaymentError,
+				Response: &HTTPResponseInstructions{
+					Status:  500,
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    map[string]string{"error": fmt.Sprintf("Failed to create payment response: %v", err)},
+				},
+			}
+		}
 		return HTTPProcessResult{
 			Type:     ResultPaymentError,
-			Response: s.createHTTPResponseV2(paymentRequired, false, paywallConfig, "", nil),
+			Response: response,
 		}
 	}
 
@@ -394,9 +418,20 @@ func (s *x402HTTPResourceServer) ProcessHTTPRequest(ctx context.Context, reqCtx 
 			extensions,
 		)
 
+		response, err := s.createHTTPResponseV2(paymentRequired, false, paywallConfig, "", nil)
+		if err != nil {
+			return HTTPProcessResult{
+				Type: ResultPaymentError,
+				Response: &HTTPResponseInstructions{
+					Status:  500,
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body:    map[string]string{"error": fmt.Sprintf("Failed to create payment response: %v", err)},
+				},
+			}
+		}
 		return HTTPProcessResult{
 			Type:     ResultPaymentError,
-			Response: s.createHTTPResponseV2(paymentRequired, false, paywallConfig, "", nil),
+			Response: response,
 		}
 	}
 
@@ -432,9 +467,17 @@ func (s *x402HTTPResourceServer) ProcessSettlement(ctx context.Context, payload 
 		}
 	}
 
+	headers, err := s.createSettlementHeaders(settleResult)
+	if err != nil {
+		return &ProcessSettleResult{
+			Success:     false,
+			ErrorReason: fmt.Sprintf("failed to create settlement headers: %v", err),
+		}
+	}
+
 	return &ProcessSettleResult{
 		Success:     true,
-		Headers:     s.createSettlementHeaders(settleResult),
+		Headers:     headers,
 		Transaction: settleResult.Transaction,
 		Network:     settleResult.Network,
 		Payer:       settleResult.Payer,
@@ -539,7 +582,7 @@ func (s *x402HTTPResourceServer) isWebBrowser(adapter HTTPAdapter) bool {
 //	paywallConfig: Optional paywall configuration
 //	customHTML: Optional custom HTML for the paywall
 //	unpaidResponse: Optional custom response for API clients (ignored for browser requests)
-func (s *x402HTTPResourceServer) createHTTPResponseV2(paymentRequired types.PaymentRequired, isWebBrowser bool, paywallConfig *PaywallConfig, customHTML string, unpaidResponse *UnpaidResponse) *HTTPResponseInstructions {
+func (s *x402HTTPResourceServer) createHTTPResponseV2(paymentRequired types.PaymentRequired, isWebBrowser bool, paywallConfig *PaywallConfig, customHTML string, unpaidResponse *UnpaidResponse) (*HTTPResponseInstructions, error) {
 	if isWebBrowser {
 		html := s.generatePaywallHTMLV2(paymentRequired, paywallConfig, customHTML)
 		return &HTTPResponseInstructions{
@@ -549,7 +592,7 @@ func (s *x402HTTPResourceServer) createHTTPResponseV2(paymentRequired types.Paym
 			},
 			Body:   html,
 			IsHTML: true,
-		}
+		}, nil
 	}
 
 	// Use custom unpaid response if provided, otherwise default to JSON with no body
@@ -561,20 +604,25 @@ func (s *x402HTTPResourceServer) createHTTPResponseV2(paymentRequired types.Paym
 		body = unpaidResponse.Body
 	}
 
+	encodedHeader, err := encodePaymentRequiredHeader(paymentRequired)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode payment required header: %w", err)
+	}
+
 	return &HTTPResponseInstructions{
 		Status: 402,
 		Headers: map[string]string{
 			"Content-Type":     contentType,
-			"PAYMENT-REQUIRED": encodePaymentRequiredHeader(paymentRequired),
+			"PAYMENT-REQUIRED": encodedHeader,
 		},
 		Body: body,
-	}
+	}, nil
 }
 
 // createHTTPResponse creates response instructions (legacy method)
 //
 //nolint:unused // Legacy method kept for API compatibility
-func (s *x402HTTPResourceServer) createHTTPResponse(paymentRequired x402.PaymentRequired, isWebBrowser bool, paywallConfig *PaywallConfig, customHTML string) *HTTPResponseInstructions {
+func (s *x402HTTPResourceServer) createHTTPResponse(paymentRequired x402.PaymentRequired, isWebBrowser bool, paywallConfig *PaywallConfig, customHTML string) (*HTTPResponseInstructions, error) {
 	// Convert to V2 and call V2 method
 	v2Required := types.PaymentRequired{
 		X402Version: 2,
@@ -586,10 +634,14 @@ func (s *x402HTTPResourceServer) createHTTPResponse(paymentRequired x402.Payment
 }
 
 // createSettlementHeaders creates settlement response headers
-func (s *x402HTTPResourceServer) createSettlementHeaders(response *x402.SettleResponse) map[string]string {
-	return map[string]string{
-		"PAYMENT-RESPONSE": encodePaymentResponseHeader(*response),
+func (s *x402HTTPResourceServer) createSettlementHeaders(response *x402.SettleResponse) (map[string]string, error) {
+	encodedHeader, err := encodePaymentResponseHeader(*response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode payment response header: %w", err)
 	}
+	return map[string]string{
+		"PAYMENT-RESPONSE": encodedHeader,
+	}, nil
 }
 
 // generatePaywallHTMLV2 generates HTML paywall for V2 PaymentRequired
@@ -618,14 +670,7 @@ func (s *x402HTTPResourceServer) generatePaywallHTMLV2(paymentRequired types.Pay
 
 	// Convert accepts
 	for _, reqV2 := range paymentRequired.Accepts {
-		genericRequired.Accepts = append(genericRequired.Accepts, x402.PaymentRequirements{
-			Scheme:  reqV2.Scheme,
-			Network: reqV2.Network,
-			Asset:   reqV2.Asset,
-			Amount:  reqV2.Amount,
-			PayTo:   reqV2.PayTo,
-			Extra:   reqV2.Extra,
-		})
+		genericRequired.Accepts = append(genericRequired.Accepts, x402.PaymentRequirements(reqV2))
 	}
 
 	// Reuse existing HTML generation
@@ -641,102 +686,63 @@ func (s *x402HTTPResourceServer) generatePaywallHTML(paymentRequired x402.Paymen
 	// Calculate display amount (assuming USDC with 6 decimals)
 	displayAmount := s.getDisplayAmount(paymentRequired)
 
-	resourceDesc := ""
-	if paymentRequired.Resource != nil {
-		if paymentRequired.Resource.Description != "" {
-			resourceDesc = paymentRequired.Resource.Description
-		} else if paymentRequired.Resource.URL != "" {
-			resourceDesc = paymentRequired.Resource.URL
-		}
-	}
-
-	appLogo := ""
 	appName := ""
-	cdpClientKey := ""
+	appLogo := ""
 	testnet := false
+	currentURL := ""
 
 	if config != nil {
-		if config.AppLogo != "" {
-			appLogo = fmt.Sprintf(`<img src="%s" alt="%s" style="max-width: 200px; margin-bottom: 20px;">`,
-				html.EscapeString(config.AppLogo),
-				html.EscapeString(config.AppName))
-		}
 		appName = config.AppName
-		cdpClientKey = config.CDPClientKey
+		appLogo = config.AppLogo
 		testnet = config.Testnet
+		currentURL = config.CurrentURL
+	}
+
+	// Use resource URL as currentUrl if not explicitly configured
+	if currentURL == "" && paymentRequired.Resource != nil {
+		currentURL = paymentRequired.Resource.URL
 	}
 
 	requirementsJSON, _ := json.Marshal(paymentRequired)
 
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-	<title>Payment Required</title>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<style>
-		body { 
-			font-family: system-ui, -apple-system, sans-serif;
-			margin: 0;
-			padding: 0;
-			background: #f5f5f5;
-		}
-		.container { 
-			max-width: 600px; 
-			margin: 50px auto; 
-			padding: 20px;
-			background: white;
-			border-radius: 8px;
-			box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-		}
-		.logo { margin-bottom: 20px; }
-		h1 { color: #333; }
-		.info { margin: 20px 0; }
-		.info p { margin: 10px 0; }
-		.amount { 
-			font-size: 24px; 
-			font-weight: bold; 
-			color: #0066cc;
-			margin: 20px 0;
-		}
-		#payment-widget {
-			margin-top: 30px;
-			padding: 20px;
-			border: 1px dashed #ccc;
-			border-radius: 4px;
-			background: #fafafa;
-			text-align: center;
-			color: #666;
-		}
-	</style>
-</head>
-<body>
-	<div class="container">
-		%s
-		<h1>Payment Required</h1>
-		<div class="info">
-			<p><strong>Resource:</strong> %s</p>
-			<p class="amount">Amount: $%.2f USDC</p>
-		</div>
-		<div id="payment-widget" 
-			data-requirements='%s'
-			data-cdp-client-key="%s"
-			data-app-name="%s"
-			data-testnet="%t">
-			<!-- CDP widget would be injected here -->
-			<p>Loading payment widget...</p>
-		</div>
-	</div>
-</body>
-</html>`,
-		appLogo,
-		html.EscapeString(resourceDesc),
-		displayAmount,
-		html.EscapeString(string(requirementsJSON)),
-		html.EscapeString(cdpClientKey),
+	// Inject configuration into the template
+	configScript := fmt.Sprintf(`<script>
+		window.x402 = {
+			paymentRequired: %s,
+			appName: "%s",
+			appLogo: "%s",
+			amount: %.6f,
+			testnet: %t,
+			displayAmount: %.2f,
+			currentUrl: "%s"
+		};
+	</script>`,
+		string(requirementsJSON),
 		html.EscapeString(appName),
+		html.EscapeString(appLogo),
+		displayAmount,
 		testnet,
+		displayAmount,
+		html.EscapeString(currentURL),
 	)
+
+	// Select template based on network
+	template := s.selectPaywallTemplate(paymentRequired)
+	return strings.Replace(template, "</body>", configScript+"</body>", 1)
+}
+
+// selectPaywallTemplate chooses the appropriate paywall template based on the network
+// Returns EVM template for eip155:* networks, SVM template for solana:* networks
+func (s *x402HTTPResourceServer) selectPaywallTemplate(paymentRequired x402.PaymentRequired) string {
+	if len(paymentRequired.Accepts) == 0 {
+		return EVMPaywallTemplate // Default to EVM
+	}
+
+	network := paymentRequired.Accepts[0].Network
+	if strings.HasPrefix(network, "solana:") {
+		return SVMPaywallTemplate
+	}
+	return EVMPaywallTemplate
 }
 
 // getDisplayAmount extracts display amount from payment requirements

@@ -1,5 +1,11 @@
 import { PaymentPayload, PaymentRequirements } from "../types/payments";
-import { VerifyResponse, SettleResponse, SupportedResponse } from "../types/facilitator";
+import {
+  VerifyResponse,
+  SettleResponse,
+  SupportedResponse,
+  VerifyError,
+  SettleError,
+} from "../types/facilitator";
 
 const DEFAULT_FACILITATOR_URL = "https://x402.org/facilitator";
 
@@ -49,6 +55,11 @@ export interface FacilitatorClient {
   getSupported(): Promise<SupportedResponse>;
 }
 
+/** Number of retries for getSupported() on 429 rate limit errors */
+const GET_SUPPORTED_RETRIES = 3;
+/** Base delay in ms for exponential backoff on retries */
+const GET_SUPPORTED_RETRY_DELAY_MS = 1000;
+
 /**
  * HTTP-based client for interacting with x402 facilitator services
  * Handles HTTP communication with facilitator endpoints
@@ -97,12 +108,17 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       }),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Facilitator verify failed (${response.status}): ${errorText}`);
+    const data = await response.json();
+
+    if (typeof data === "object" && data !== null && "isValid" in data) {
+      const verifyResponse = data as VerifyResponse;
+      if (!response.ok) {
+        throw new VerifyError(response.status, verifyResponse);
+      }
+      return verifyResponse;
     }
 
-    return (await response.json()) as VerifyResponse;
+    throw new Error(`Facilitator verify failed (${response.status}): ${JSON.stringify(data)}`);
   }
 
   /**
@@ -135,16 +151,22 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       }),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Facilitator settle failed (${response.status}): ${errorText}`);
+    const data = await response.json();
+
+    if (typeof data === "object" && data !== null && "success" in data) {
+      const settleResponse = data as SettleResponse;
+      if (!response.ok) {
+        throw new SettleError(response.status, settleResponse);
+      }
+      return settleResponse;
     }
 
-    return (await response.json()) as SettleResponse;
+    throw new Error(`Facilitator settle failed (${response.status}): ${JSON.stringify(data)}`);
   }
 
   /**
-   * Get supported payment kinds and extensions from the facilitator
+   * Get supported payment kinds and extensions from the facilitator.
+   * Retries with exponential backoff on 429 rate limit errors.
    *
    * @returns Supported payment kinds and extensions
    */
@@ -158,17 +180,31 @@ export class HTTPFacilitatorClient implements FacilitatorClient {
       headers = { ...headers, ...authHeaders.headers };
     }
 
-    const response = await fetch(`${this.url}/supported`, {
-      method: "GET",
-      headers,
-    });
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < GET_SUPPORTED_RETRIES; attempt++) {
+      const response = await fetch(`${this.url}/supported`, {
+        method: "GET",
+        headers,
+      });
 
-    if (!response.ok) {
+      if (response.ok) {
+        return (await response.json()) as SupportedResponse;
+      }
+
       const errorText = await response.text().catch(() => response.statusText);
-      throw new Error(`Facilitator getSupported failed (${response.status}): ${errorText}`);
+      lastError = new Error(`Facilitator getSupported failed (${response.status}): ${errorText}`);
+
+      // Retry on 429 rate limit errors with exponential backoff
+      if (response.status === 429 && attempt < GET_SUPPORTED_RETRIES - 1) {
+        const delay = GET_SUPPORTED_RETRY_DELAY_MS * Math.pow(2, attempt);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      throw lastError;
     }
 
-    return (await response.json()) as SupportedResponse;
+    throw lastError ?? new Error("Facilitator getSupported failed after retries");
   }
 
   /**
