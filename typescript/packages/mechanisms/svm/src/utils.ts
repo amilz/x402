@@ -116,6 +116,21 @@ export function getTokenPayerFromTransaction(transaction: Transaction): string {
 }
 
 /**
+ * Whether a decoded transaction message's version is one the SVM schemes know
+ * how to police. Every verification path here derives its sponsorship policy
+ * from version-specific structure (ComputeBudget instructions on legacy and
+ * version 0, `message.config` on version 1), so a version this code predates
+ * must be rejected explicitly: once the resolved `@solana/kit` learns to
+ * decode it, version-blind checks would otherwise pass vacuously.
+ *
+ * @param version - The `version` field of a compiled or decompiled transaction message
+ * @returns Whether the version is legacy, 0, or 1
+ */
+export function isSupportedTransactionVersion(version: number | string): boolean {
+  return version === "legacy" || version === 0 || version === 1;
+}
+
+/**
  * A way a version 1 transaction's `message.config` violates the facilitator's
  * sponsorship policy, as reported by {@link checkV1TransactionConfig}. Call
  * sites map each violation to their scheme-specific error code.

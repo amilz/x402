@@ -171,10 +171,11 @@ export class ExactSvmSchemeV1 implements SchemeNetworkFacilitator {
 
     // The legacy x402 v1 wire format predates transaction version 1 and its
     // instruction checks assume compute budget arrives as ComputeBudget
-    // instructions, which version 1 moves into `message.config`. Gate the
-    // version explicitly so those checks cannot pass vacuously; version 1
+    // instructions, which version 1 moves into `message.config` and a future
+    // version may move elsewhere again. Allow only the versions those checks
+    // understand so nothing newer can pass them vacuously; transaction v1
     // support lives in the current protocol's ExactSvmScheme.
-    if (compiled.version === 1) {
+    if (compiled.version !== "legacy" && compiled.version !== 0) {
       return {
         isValid: false,
         invalidReason: "unsupported_transaction_version",

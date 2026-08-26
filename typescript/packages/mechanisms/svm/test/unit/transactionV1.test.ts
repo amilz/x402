@@ -4,7 +4,6 @@ import {
   compileTransactionMessage,
   createTransactionMessage,
   generateKeyPairSigner,
-  getBase64EncodedWireTransaction,
   getCompiledTransactionMessageEncoder,
   pipe,
   setTransactionMessageConfig,
@@ -17,6 +16,11 @@ import {
 } from "@solana/kit";
 import { TOKEN_PROGRAM_ADDRESS } from "@solana-program/token";
 import { validateComputeBudgetLimits } from "../../src/exact/facilitator/smartWalletVerification";
+import {
+  encodeSignedTransaction,
+  placeholderFeePayerSignature,
+  type MessageSigner,
+} from "./helpers/signedTransaction";
 import { verifyOpenTransaction } from "../../src/payment-channels/open";
 import {
   checkV1TransactionConfig,
@@ -77,12 +81,12 @@ function transferCheckedInstruction(args: {
   } as Instruction;
 }
 
-function buildV1Transaction(args: {
+async function buildV1Transaction(args: {
   feePayer: Address;
   instructions: Instruction[];
   config?: V1TransactionConfig;
-  signers?: Address[];
-}): string {
+  signers?: MessageSigner[];
+}): Promise<string> {
   let msg = pipe(
     createTransactionMessage({ version: 1 }),
     m => setTransactionMessageFeePayer(args.feePayer, m),
@@ -98,10 +102,11 @@ function buildV1Transaction(args: {
   const messageBytes = getCompiledTransactionMessageEncoder().encode(
     compileTransactionMessage(withInstructions),
   );
-  const signatures = Object.fromEntries(
-    [args.feePayer, ...(args.signers ?? [])].map(a => [a, new Uint8Array(64)]),
+  return encodeSignedTransaction(
+    messageBytes,
+    args.signers ?? [],
+    placeholderFeePayerSignature(args.feePayer),
   );
-  return getBase64EncodedWireTransaction({ messageBytes, signatures } as never);
 }
 
 describe("checkV1TransactionConfig", () => {
@@ -190,7 +195,7 @@ describe("getTokenPayerFromTransaction on version 1 transactions", () => {
       generateKeyPairSigner(),
       generateKeyPairSigner(),
     ]);
-    const txBase64 = buildV1Transaction({
+    const txBase64 = await buildV1Transaction({
       feePayer: feePayer.address,
       config: { computeUnitLimit: 20_000 },
       instructions: [
@@ -202,7 +207,7 @@ describe("getTokenPayerFromTransaction on version 1 transactions", () => {
           amount: 100_000n,
         }),
       ],
-      signers: [authority.address],
+      signers: [authority],
     });
     const transaction = decodeTransactionFromPayload({ transaction: txBase64 });
     expect(getTokenPayerFromTransaction(transaction)).toBe(authority.address);
@@ -245,11 +250,11 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
       extra: { feePayer: feePayer.address },
     } as PaymentRequirements;
 
-    const buildPayload = (
+    const buildPayload = async (
       config: V1TransactionConfig | undefined,
       trailing: Instruction[] = [],
-    ): PaymentPayload => {
-      const transaction = buildV1Transaction({
+    ): Promise<PaymentPayload> => {
+      const transaction = await buildV1Transaction({
         feePayer: feePayer.address,
         config,
         instructions: [
@@ -262,7 +267,7 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
           }),
           ...trailing,
         ],
-        signers: [authority.address],
+        signers: [authority],
       });
       return {
         x402Version: 2,
@@ -277,7 +282,7 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
   it("accepts a valid version 1 transfer and reads limits from message.config", async () => {
     const { scheme, requirements, buildPayload, authority } = await setup();
     const result = await scheme.verify(
-      buildPayload({
+      await buildPayload({
         computeUnitLimit: 20_000,
         loadedAccountsDataSizeLimit: 65_536,
         priorityFeeLamports: 100_000n,
@@ -296,7 +301,9 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
       data: new TextEncoder().encode("unique-nonce"),
     } as Instruction;
     const result = await scheme.verify(
-      buildPayload({ computeUnitLimit: 20_000, loadedAccountsDataSizeLimit: 65_536 }, [memoIx]),
+      await buildPayload({ computeUnitLimit: 20_000, loadedAccountsDataSizeLimit: 65_536 }, [
+        memoIx,
+      ]),
       requirements,
     );
     expect(result.isValid).toBe(true);
@@ -304,7 +311,7 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
 
   it("rejects a version 1 transaction with no compute unit limit", async () => {
     const { scheme, requirements, buildPayload } = await setup();
-    const result = await scheme.verify(buildPayload(undefined), requirements);
+    const result = await scheme.verify(await buildPayload(undefined), requirements);
     expect(result.isValid).toBe(false);
     expect(result.invalidReason).toBe(
       "invalid_exact_svm_payload_transaction_config_compute_limit_missing",
@@ -313,7 +320,10 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
 
   it("rejects a version 1 transaction with no loaded accounts data size limit", async () => {
     const { scheme, requirements, buildPayload } = await setup();
-    const result = await scheme.verify(buildPayload({ computeUnitLimit: 20_000 }), requirements);
+    const result = await scheme.verify(
+      await buildPayload({ computeUnitLimit: 20_000 }),
+      requirements,
+    );
     expect(result.isValid).toBe(false);
     expect(result.invalidReason).toBe(
       "invalid_exact_svm_payload_transaction_config_loaded_accounts_data_size_limit_missing",
@@ -322,7 +332,10 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
 
   it("rejects a version 1 compute unit limit above the operator cap", async () => {
     const { scheme, requirements, buildPayload } = await setup({ maxComputeUnits: 20_000 });
-    const result = await scheme.verify(buildPayload({ computeUnitLimit: 400_000 }), requirements);
+    const result = await scheme.verify(
+      await buildPayload({ computeUnitLimit: 400_000 }),
+      requirements,
+    );
     expect(result.isValid).toBe(false);
     expect(result.invalidReason).toBe(
       "invalid_exact_svm_payload_transaction_config_compute_limit_too_high",
@@ -334,7 +347,7 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
     // at most 100,000 lamports of total priority fee.
     const { scheme, requirements, buildPayload } = await setup();
     const result = await scheme.verify(
-      buildPayload({
+      await buildPayload({
         computeUnitLimit: 20_000,
         loadedAccountsDataSizeLimit: 65_536,
         priorityFeeLamports: 100_001n,
@@ -354,7 +367,7 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
       data: new Uint8Array([2, 160, 134, 1, 0]),
     } as Instruction;
     const result = await scheme.verify(
-      buildPayload({ computeUnitLimit: 20_000, loadedAccountsDataSizeLimit: 65_536 }, [
+      await buildPayload({ computeUnitLimit: 20_000, loadedAccountsDataSizeLimit: 65_536 }, [
         computeBudgetIx,
       ]),
       requirements,
@@ -367,7 +380,7 @@ describe("ExactSvmScheme static path with version 1 transactions", () => {
 describe("validateComputeBudgetLimits with version 1 transactions", () => {
   async function buildV1(config: V1TransactionConfig | undefined, instructions: Instruction[]) {
     const feePayer = await generateKeyPairSigner();
-    const txBase64 = buildV1Transaction({
+    const txBase64 = await buildV1Transaction({
       feePayer: feePayer.address,
       config,
       instructions,
@@ -439,7 +452,7 @@ describe("validateComputeBudgetLimits with version 1 transactions", () => {
 describe("version 1 gates in schemes without config support", () => {
   it("verifyOpenTransaction rejects a version 1 open transaction", async () => {
     const [feePayer, payer] = await Promise.all([generateKeyPairSigner(), generateKeyPairSigner()]);
-    const txBase64 = buildV1Transaction({
+    const txBase64 = await buildV1Transaction({
       feePayer: feePayer.address,
       config: { computeUnitLimit: 200_000 },
       instructions: [
@@ -472,7 +485,7 @@ describe("version 1 gates in schemes without config support", () => {
       generateKeyPairSigner(),
       generateKeyPairSigner(),
     ]);
-    const transaction = buildV1Transaction({
+    const transaction = await buildV1Transaction({
       feePayer: feePayer.address,
       config: { computeUnitLimit: 20_000 },
       instructions: [
@@ -484,7 +497,7 @@ describe("version 1 gates in schemes without config support", () => {
           amount: 100_000n,
         }),
       ],
-      signers: [authority.address],
+      signers: [authority],
     });
 
     const mockSigner = {

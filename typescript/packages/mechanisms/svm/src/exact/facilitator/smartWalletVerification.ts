@@ -20,7 +20,11 @@ import {
 import type { PaymentRequirements, VerifyResponse } from "@x402/core/types";
 import { MEMO_PROGRAM_ADDRESS } from "../../constants";
 import type { FacilitatorSvmSigner, SvmInnerInstructionsResult } from "../../signer";
-import { checkV1TransactionConfig, decodeTransactionFromPayload } from "../../utils";
+import {
+  checkV1TransactionConfig,
+  decodeTransactionFromPayload,
+  isSupportedTransactionVersion,
+} from "../../utils";
 import * as Errors from "./errors";
 
 const DEFAULT_SMART_WALLET_MAX_COMPUTE_UNITS = 400_000;
@@ -84,6 +88,20 @@ type InstructionDataBytes = {
   readonly byteLength: number;
 };
 
+/**
+ * The parts of a decompiled message that determine where its compute budget
+ * lives: legacy and version 0 messages declare it in ComputeBudget
+ * instructions, while version 1 declares it in `config`.
+ */
+export type DecodedMessageBudget = {
+  version?: number | string;
+  config?: {
+    computeUnitLimit?: number;
+    loadedAccountsDataSizeLimit?: number;
+    priorityFeeLamports?: bigint;
+  };
+};
+
 export type DecodedInstructionView = {
   programAddress: { toString(): string };
   accounts?: ReadonlyArray<{ address: { toString(): string } }>;
@@ -104,7 +122,7 @@ export type DecodedTransactionView = {
       readonlyIndexes: readonly number[];
     }>;
   };
-  decompiled: {
+  decompiled: DecodedMessageBudget & {
     instructions?: ReadonlyArray<DecodedInstructionView>;
   };
   resolvedAccountKeys: readonly string[];
@@ -248,11 +266,24 @@ export function validateComputeBudgetLimits(
     limits?.maxPriorityFeeMicroLamports ?? DEFAULT_SMART_WALLET_MAX_PRIORITY_FEE_MICROLAMPORTS;
 
   const compiled = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+
+  // Fail closed on any version these checks predate: the caps below are
+  // derived from version-specific structure, so an unknown version would
+  // otherwise sail through the instruction scan with its real budget carried
+  // somewhere this code does not look.
+  if (!isSupportedTransactionVersion(compiled.version)) {
+    throw new Error(`smart_wallet_unsupported_transaction_version: ${compiled.version}`);
+  }
+
   const decompiled = decompileTransactionMessage(compiled);
-  validateComputeBudgetLimitsFromInstructions(decompiled.instructions ?? [], {
-    maxComputeUnits: maxCU,
-    maxPriorityFeeMicroLamports: maxPriorityFee,
-  });
+  validateComputeBudgetLimitsFromInstructions(
+    decompiled.instructions ?? [],
+    {
+      maxComputeUnits: maxCU,
+      maxPriorityFeeMicroLamports: maxPriorityFee,
+    },
+    decompiled,
+  );
 }
 
 /**
@@ -262,10 +293,14 @@ export function validateComputeBudgetLimits(
  * @param limits - Resolved compute budget caps (defaults already applied)
  * @param limits.maxComputeUnits - Maximum allowed compute units
  * @param limits.maxPriorityFeeMicroLamports - Maximum allowed priority fee
+ * @param budget - Version and `message.config` of the decompiled message. A
+ *   version 1 message carries its compute budget here rather than in
+ *   instructions; omitting it treats the message as legacy / version 0.
  */
 export function validateComputeBudgetLimitsFromInstructions(
   instructions: ReadonlyArray<DecodedInstructionView>,
   limits: { maxComputeUnits: number; maxPriorityFeeMicroLamports: number },
+  budget?: DecodedMessageBudget,
 ): void {
   const maxCU = limits.maxComputeUnits;
   const maxPriorityFee = limits.maxPriorityFeeMicroLamports;
@@ -276,7 +311,7 @@ export function validateComputeBudgetLimitsFromInstructions(
   // transaction is rejected outright: the config is authoritative there, so
   // such an instruction can only be an attempt to satisfy an
   // instruction-scanning check while the config carries different values.
-  if (decompiled.version === 1) {
+  if (budget?.version === 1) {
     for (const ix of instructions) {
       if (ix.programAddress.toString() === COMPUTE_BUDGET_PROGRAM_ADDRESS.toString()) {
         throw new Error(
@@ -284,7 +319,7 @@ export function validateComputeBudgetLimitsFromInstructions(
         );
       }
     }
-    const violation = checkV1TransactionConfig(decompiled.config, {
+    const violation = checkV1TransactionConfig(budget.config, {
       maxComputeUnits: maxCU,
       maxPriorityFeeMicroLamports: maxPriorityFee,
     });
@@ -295,7 +330,7 @@ export function validateComputeBudgetLimitsFromInstructions(
     }
     if (violation === "compute_unit_limit_too_high") {
       throw new Error(
-        `smart_wallet_compute_units_too_high: ${decompiled.config?.computeUnitLimit} exceeds max ${maxCU}`,
+        `smart_wallet_compute_units_too_high: ${budget.config?.computeUnitLimit} exceeds max ${maxCU}`,
       );
     }
     if (violation === "loaded_accounts_data_size_limit_missing") {
@@ -305,7 +340,7 @@ export function validateComputeBudgetLimitsFromInstructions(
     }
     if (violation === "priority_fee_too_high") {
       throw new Error(
-        `smart_wallet_priority_fee_too_high: ${decompiled.config?.priorityFeeLamports} lamports exceeds max ${maxPriorityFee} micro-lamports per CU over ${decompiled.config?.computeUnitLimit} CUs`,
+        `smart_wallet_priority_fee_too_high: ${budget.config?.priorityFeeLamports} lamports exceeds max ${maxPriorityFee} micro-lamports per CU over ${budget.config?.computeUnitLimit} CUs`,
       );
     }
     return;
@@ -505,10 +540,14 @@ export async function verifySmartWalletTransaction(
       const maxCU = options?.maxComputeUnits ?? DEFAULT_SMART_WALLET_MAX_COMPUTE_UNITS;
       const maxPriorityFee =
         options?.maxPriorityFeeMicroLamports ?? DEFAULT_SMART_WALLET_MAX_PRIORITY_FEE_MICROLAMPORTS;
-      validateComputeBudgetLimitsFromInstructions(instructions, {
-        maxComputeUnits: maxCU,
-        maxPriorityFeeMicroLamports: maxPriorityFee,
-      });
+      validateComputeBudgetLimitsFromInstructions(
+        instructions,
+        {
+          maxComputeUnits: maxCU,
+          maxPriorityFeeMicroLamports: maxPriorityFee,
+        },
+        decoded?.decompiled,
+      );
     } else {
       validateComputeBudgetLimits(transaction, {
         maxComputeUnits: options?.maxComputeUnits,

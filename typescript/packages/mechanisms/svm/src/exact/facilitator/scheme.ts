@@ -40,6 +40,7 @@ import type { ExactSvmPayloadV2 } from "../../types";
 import {
   checkV1TransactionConfig,
   decodeTransactionFromPayload,
+  isSupportedTransactionVersion,
   getTokenPayerFromTransaction,
   recordPendingOrTerminal,
   transactionMessageHash,
@@ -799,6 +800,22 @@ export class ExactSvmScheme implements SchemeNetworkFacilitator {
         response: {
           isValid: false,
           invalidReason: Errors.ErrTransactionCouldNotBeDecoded,
+          payer: "",
+        },
+        verificationPath: null,
+      };
+    }
+
+    // Version allowlist, checked before path dispatch: every check below
+    // derives its sponsorship policy from version-specific structure
+    // (ComputeBudget instructions, or version 1's `message.config`), so a
+    // version this code predates must fail closed here rather than pass those
+    // checks vacuously once a future @solana/kit learns to decode it.
+    if (!isSupportedTransactionVersion(compiled.version)) {
+      return {
+        response: {
+          isValid: false,
+          invalidReason: "unsupported_transaction_version",
           payer: "",
         },
         verificationPath: null,
