@@ -88,6 +88,8 @@ const V1_CONFIG_INVALID_REASONS: Record<V1ConfigViolation, string> = {
   compute_unit_limit_missing: "invalid_exact_svm_payload_transaction_config_compute_limit_missing",
   compute_unit_limit_too_high:
     "invalid_exact_svm_payload_transaction_config_compute_limit_too_high",
+  loaded_accounts_data_size_limit_missing:
+    "invalid_exact_svm_payload_transaction_config_loaded_accounts_data_size_limit_missing",
   priority_fee_too_high: "invalid_exact_svm_payload_transaction_config_priority_fee_too_high",
 };
 

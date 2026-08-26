@@ -298,6 +298,11 @@ export function validateComputeBudgetLimitsFromInstructions(
         `smart_wallet_compute_units_too_high: ${decompiled.config?.computeUnitLimit} exceeds max ${maxCU}`,
       );
     }
+    if (violation === "loaded_accounts_data_size_limit_missing") {
+      throw new Error(
+        "smart_wallet_loaded_accounts_data_size_limit_missing: version 1 transactions must set config.loadedAccountsDataSizeLimit",
+      );
+    }
     if (violation === "priority_fee_too_high") {
       throw new Error(
         `smart_wallet_priority_fee_too_high: ${decompiled.config?.priorityFeeLamports} lamports exceeds max ${maxPriorityFee} micro-lamports per CU over ${decompiled.config?.computeUnitLimit} CUs`,
